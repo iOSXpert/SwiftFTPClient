@@ -390,4 +390,115 @@ public class FTPClient {
             }
         }
     }
+    
+    public func listDirectory(path: String? = nil) async throws -> [FTPEntry] {
+        // Connect if needed
+        if controlConnection == nil {
+            try await connect()
+        }
+
+        // Optionally change directory
+        if let path = path {
+            try await sendCommand("CWD \(path)")
+            let cwdResp = try await readResponse()
+            guard cwdResp.hasPrefix("250") else { throw FTPError.other("CWD failed: \(cwdResp)") }
+        }
+
+        // Open passive data connection
+        let dataConnection = try await enterPassiveModeAndOpenDataConnection()
+
+        // Prefer machine-readable MLSD; if it fails, fall back to LIST
+        try await sendCommand("MLSD")
+        var resp = try await readResponse()
+        var usedCommand = "MLSD"
+        if !resp.hasPrefix("150") { // 150 Opening data connection
+            // Some servers don’t support MLSD; try LIST
+            try await sendCommand("LIST")
+            resp = try await readResponse()
+            guard resp.hasPrefix("150") else { throw FTPError.other("Directory list not supported: \(resp)") }
+            usedCommand = "LIST"
+        }
+
+        // Read all bytes from data socket
+        let data = try await readAllData(from: dataConnection)
+        dataConnection.cancel()
+
+        // Final status from control channel (226 = transfer complete)
+        let final = try await readResponse()
+        guard final.hasPrefix("226") else { throw FTPError.other("LIST failed: \(final)") }
+
+        // Parse
+        let text = String(decoding: data, as: UTF8.self)
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        if usedCommand == "MLSD" {
+            return parseMLSD(lines: lines)
+        } else {
+            return parseLIST(lines: lines)
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func readAllData(from connection: NWConnection) async throws -> Data {
+        var buffer = Data()
+        while true {
+            let chunk: (Data?, Bool) = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data?, Bool), Error>) in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 32 * 1024) { data, _, isComplete, error in
+                    if let error = error {
+                        cont.resume(throwing: FTPError.transferFailed(error.localizedDescription))
+                    } else {
+                        cont.resume(returning: (data, isComplete))
+                    }
+                }
+            }
+            if let data = chunk.0 { buffer.append(data) }
+            if chunk.1 { break } // server closed data connection
+            if chunk.0 == nil && !chunk.1 { break }
+        }
+        return buffer
+    }
+
+    private func parseMLSD(lines: [String]) -> [FTPEntry] {
+        var entries: [FTPEntry] = []
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyyMMddHHmmss"
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        for line in lines {
+            // format: "type=file;size=123;modify=20250101123456; ... filename"
+            guard let space = line.firstIndex(of: " ") else { continue }
+            let factsPart = line[..<space]
+            let name = line[line.index(after: space)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            var facts: [String: String] = [:]
+            for fact in factsPart.split(separator: ";") {
+                if fact.isEmpty { continue }
+                let kv = fact.split(separator: "=", maxSplits: 1).map(String.init)
+                if kv.count == 2 { facts[kv[0].lowercased()] = kv[1] }
+            }
+            let isDir = facts["type"] == "dir" || facts["type"] == "cdir" || facts["type"] == "pdir"
+            let size: Int64? = facts["size"].flatMap(Int64.init)
+            let modified: Date? = facts["modify"].flatMap { dateFormatter.date(from: $0) }
+            if facts["type"] != "pdir" && facts["type"] != "cdir" { // skip . and ..
+                entries.append(FTPEntry(name: name, isDirectory: isDir, size: size, modified: modified))
+            }
+        }
+        return entries
+    }
+
+    private func parseLIST(lines: [String]) -> [FTPEntry] {
+        // Very basic Unix LIST parser, best-effort only
+        var entries: [FTPEntry] = []
+        for line in lines {
+            // e.g., "drwxr-xr-x  2 user group     4096 Jan  1 12:00 dirname"
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 9 else { continue }
+            let perms = String(parts[0])
+            let isDir = perms.first == "d"
+            let size = Int64(parts[4])
+            // filename starts after the date fields (usually at index >= 8)
+            let name = parts.dropFirst(8).joined(separator: " ")
+            entries.append(FTPEntry(name: name, isDirectory: isDir, size: size, modified: nil))
+        }
+        return entries
+    }
 }
